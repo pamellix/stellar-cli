@@ -2,22 +2,28 @@ use std::array::TryFromSliceError;
 use std::fmt::Debug;
 use std::num::ParseIntError;
 
-use clap::{command, Parser};
-use soroban_env_host::xdr::{
+use crate::xdr::{
     self, ContractCodeEntryExt, Error as XdrError, Hash, HostFunction, InvokeHostFunctionOp,
-    LedgerEntryData, Limits, Memo, MuxedAccount, Operation, OperationBody, Preconditions, ReadXdr,
-    ScMetaEntry, ScMetaV0, SequenceNumber, Transaction, TransactionExt, TransactionResult,
-    TransactionResultResult, Uint256, VecM, WriteXdr,
+    LedgerEntryData, Limits, OperationBody, ReadXdr, ScMetaEntry, ScMetaV0, Transaction,
+    TransactionResult, TransactionResultResult, VecM, WriteXdr,
 };
+use clap::{command, Parser};
 
 use super::restore;
-use crate::commands::txn_result::{TxnEnvelopeResult, TxnResult};
-use crate::commands::{global, NetworkRunnable};
-use crate::config::{self, data, network};
-use crate::key;
-use crate::print::Print;
-use crate::rpc::{self, Client};
-use crate::{utils, wasm};
+use crate::{
+    assembled::simulate_and_assemble_transaction,
+    commands::{
+        global,
+        txn_result::{TxnEnvelopeResult, TxnResult},
+        NetworkRunnable,
+    },
+    config::{self, data, network},
+    key,
+    print::Print,
+    rpc,
+    tx::builder::{self, TxExt},
+    utils, wasm,
+};
 
 const CONTRACT_META_SDK_KEY: &str = "rssdkver";
 const PUBLIC_NETWORK_PASSPHRASE: &str = "Public Global Stellar Network ; September 2015";
@@ -70,6 +76,8 @@ pub enum Error {
     Network(#[from] network::Error),
     #[error(transparent)]
     Data(#[from] data::Error),
+    #[error(transparent)]
+    Builder(#[from] builder::Error),
 }
 
 impl Cmd {
@@ -100,7 +108,7 @@ impl NetworkRunnable for Cmd {
         let config = config.unwrap_or(&self.config);
         let contract = self.wasm.read()?;
         let network = config.get_network()?;
-        let client = Client::new(&network.rpc_url)?;
+        let client = network.rpc_client()?;
         client
             .verify_network_passphrase(Some(&network.network_passphrase))
             .await?;
@@ -126,16 +134,16 @@ impl NetworkRunnable for Cmd {
             }
         }
 
-        let key = config.key_pair()?;
-
         // Get the account sequence number
-        let public_strkey =
-            stellar_strkey::ed25519::PublicKey(key.verifying_key().to_bytes()).to_string();
-        let account_details = client.get_account(&public_strkey).await?;
+        let source_account = config.source_account()?;
+
+        let account_details = client
+            .get_account(&source_account.clone().to_string())
+            .await?;
         let sequence: i64 = account_details.seq_num.into();
 
         let (tx_without_preflight, hash) =
-            build_install_contract_code_tx(&contract, sequence + 1, self.fee.fee, &key)?;
+            build_install_contract_code_tx(&contract, sequence + 1, self.fee.fee, &source_account)?;
 
         if self.fee.build_only {
             return Ok(TxnResult::Txn(tx_without_preflight));
@@ -177,9 +185,7 @@ impl NetworkRunnable for Cmd {
 
         print.infoln("Simulating install transaction…");
 
-        let txn = client
-            .simulate_and_assemble_transaction(&tx_without_preflight)
-            .await?;
+        let txn = simulate_and_assemble_transaction(&client, &tx_without_preflight).await?;
         let txn = self.fee.apply_to_assembled_txn(txn).transaction().clone();
 
         if self.fee.sim_only {
@@ -200,7 +206,7 @@ impl NetworkRunnable for Cmd {
         if let Some(TransactionResult {
             result: TransactionResultResult::TxInternalError,
             ..
-        }) = txn_resp.result.as_ref()
+        }) = txn_resp.result
         {
             // Now just need to restore it and don't have to install again
             restore::Cmd {
@@ -255,29 +261,18 @@ pub(crate) fn build_install_contract_code_tx(
     source_code: &[u8],
     sequence: i64,
     fee: u32,
-    key: &ed25519_dalek::SigningKey,
-) -> Result<(Transaction, Hash), XdrError> {
+    source: &xdr::MuxedAccount,
+) -> Result<(Transaction, Hash), Error> {
     let hash = utils::contract_hash(source_code)?;
 
-    let op = Operation {
-        source_account: Some(MuxedAccount::Ed25519(Uint256(
-            key.verifying_key().to_bytes(),
-        ))),
+    let op = xdr::Operation {
+        source_account: None,
         body: OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
             host_function: HostFunction::UploadContractWasm(source_code.try_into()?),
             auth: VecM::default(),
         }),
     };
-
-    let tx = Transaction {
-        source_account: MuxedAccount::Ed25519(Uint256(key.verifying_key().to_bytes())),
-        fee,
-        seq_num: SequenceNumber(sequence),
-        cond: Preconditions::None,
-        memo: Memo::None,
-        operations: vec![op].try_into()?,
-        ext: TransactionExt::V0,
-    };
+    let tx = Transaction::new_tx(source.clone(), fee, sequence, op);
 
     Ok((tx, hash))
 }
@@ -292,8 +287,16 @@ mod tests {
             b"foo",
             300,
             1,
-            &utils::parse_secret_key("SBFGFF27Y64ZUGFAIG5AMJGQODZZKV2YQKAVUUN4HNE24XZXD2OEUVUP")
-                .unwrap(),
+            &stellar_strkey::ed25519::PublicKey::from_payload(
+                utils::parse_secret_key("SBFGFF27Y64ZUGFAIG5AMJGQODZZKV2YQKAVUUN4HNE24XZXD2OEUVUP")
+                    .unwrap()
+                    .verifying_key()
+                    .as_bytes(),
+            )
+            .unwrap()
+            .to_string()
+            .parse()
+            .unwrap(),
         );
 
         assert!(result.is_ok());

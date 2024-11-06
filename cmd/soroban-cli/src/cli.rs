@@ -1,10 +1,10 @@
 use clap::CommandFactory;
 use dotenvy::dotenv;
-use std::thread;
 use tracing_subscriber::{fmt, EnvFilter};
 
+use crate::print::Print;
 use crate::upgrade_check::upgrade_check;
-use crate::{commands, print, Root};
+use crate::{commands, Root};
 
 #[tokio::main]
 pub async fn main() {
@@ -43,6 +43,7 @@ pub async fn main() {
             std::process::exit(1);
         }
     });
+
     // Now use root to setup the logger
     if let Some(level) = root.global_args.log_level() {
         let mut e_filter = EnvFilter::from_default_env()
@@ -75,11 +76,11 @@ pub async fn main() {
     // Spawn a thread to check if a new version exists.
     // It depends on logger, so we need to place it after
     // the code block that initializes the logger.
-    thread::spawn(move || {
-        upgrade_check(root.global_args.quiet);
+    tokio::spawn(async move {
+        upgrade_check(root.global_args.quiet).await;
     });
 
-    let printer = print::Print::new(root.global_args.quiet);
+    let printer = Print::new(root.global_args.quiet);
     if let Err(e) = root.run().await {
         printer.errorln(format!("error: {e}"));
         std::process::exit(1);

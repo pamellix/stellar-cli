@@ -1,33 +1,28 @@
-use clap::{arg, command, Parser};
-use soroban_env_host::{
-    xdr::{
-        Asset, ContractDataDurability, ContractExecutable, ContractIdPreimage, CreateContractArgs,
-        Error as XdrError, Hash, HostFunction, InvokeHostFunctionOp, LedgerKey::ContractData,
-        LedgerKeyContractData, Limits, Memo, MuxedAccount, Operation, OperationBody, Preconditions,
-        ScAddress, ScVal, SequenceNumber, Transaction, TransactionExt, Uint256, VecM, WriteXdr,
-    },
-    HostError,
+use crate::xdr::{
+    Asset, ContractDataDurability, ContractExecutable, ContractIdPreimage, CreateContractArgs,
+    Error as XdrError, Hash, HostFunction, InvokeHostFunctionOp, LedgerKey::ContractData,
+    LedgerKeyContractData, Limits, Memo, MuxedAccount, Operation, OperationBody, Preconditions,
+    ScAddress, ScVal, SequenceNumber, Transaction, TransactionExt, VecM, WriteXdr,
 };
+use clap::{arg, command, Parser};
 use std::convert::Infallible;
 use std::{array::TryFromSliceError, fmt::Debug, num::ParseIntError};
 
 use crate::{
+    assembled::simulate_and_assemble_transaction,
     commands::{
         global,
         txn_result::{TxnEnvelopeResult, TxnResult},
         NetworkRunnable,
     },
     config::{self, data, network},
-    rpc::{Client, Error as SorobanRpcError},
-    utils::{contract_id_hash_from_asset, parsing::parse_asset},
+    rpc::Error as SorobanRpcError,
+    tx::builder,
+    utils::contract_id_hash_from_asset,
 };
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
-    #[error(transparent)]
-    // TODO: the Display impl of host errors is pretty user-unfriendly
-    //       (it just calls Debug). I think we can do better than that
-    Host(#[from] HostError),
     #[error("error parsing int: {0}")]
     ParseIntError(#[from] ParseIntError),
     #[error(transparent)]
@@ -39,11 +34,11 @@ pub enum Error {
     #[error(transparent)]
     Config(#[from] config::Error),
     #[error(transparent)]
-    ParseAssetError(#[from] crate::utils::parsing::Error),
-    #[error(transparent)]
     Data(#[from] data::Error),
     #[error(transparent)]
     Network(#[from] network::Error),
+    #[error(transparent)]
+    Builder(#[from] builder::Error),
 }
 
 impl From<Infallible> for Error {
@@ -57,7 +52,7 @@ impl From<Infallible> for Error {
 pub struct Cmd {
     /// ID of the Stellar classic asset to wrap, e.g. "USDC:G...5"
     #[arg(long)]
-    pub asset: String,
+    pub asset: builder::Asset,
 
     #[command(flatten)]
     pub config: config::Args,
@@ -90,35 +85,34 @@ impl NetworkRunnable for Cmd {
     ) -> Result<Self::Result, Error> {
         let config = config.unwrap_or(&self.config);
         // Parse asset
-        let asset = parse_asset(&self.asset)?;
+        let asset = &self.asset;
 
         let network = config.get_network()?;
-        let client = Client::new(&network.rpc_url)?;
+        let client = network.rpc_client()?;
         client
             .verify_network_passphrase(Some(&network.network_passphrase))
             .await?;
-        let key = config.key_pair()?;
-
+        let source_account = config.source_account()?;
         // Get the account sequence number
-        let public_strkey =
-            stellar_strkey::ed25519::PublicKey(key.verifying_key().to_bytes()).to_string();
         // TODO: use symbols for the method names (both here and in serve)
-        let account_details = client.get_account(&public_strkey).await?;
+        let account_details = client
+            .get_account(&source_account.clone().to_string())
+            .await?;
         let sequence: i64 = account_details.seq_num.into();
         let network_passphrase = &network.network_passphrase;
-        let contract_id = contract_id_hash_from_asset(&asset, network_passphrase);
+        let contract_id = contract_id_hash_from_asset(asset, network_passphrase);
         let tx = build_wrap_token_tx(
-            &asset,
+            asset,
             &contract_id,
             sequence + 1,
             self.fee.fee,
             network_passphrase,
-            &key,
+            source_account,
         )?;
         if self.fee.build_only {
             return Ok(TxnResult::Txn(tx));
         }
-        let txn = client.simulate_and_assemble_transaction(&tx).await?;
+        let txn = simulate_and_assemble_transaction(&client, &tx).await?;
         let txn = self.fee.apply_to_assembled_txn(txn).transaction().clone();
         if self.fee.sim_only {
             return Ok(TxnResult::Txn(txn));
@@ -136,14 +130,14 @@ impl NetworkRunnable for Cmd {
 }
 
 fn build_wrap_token_tx(
-    asset: &Asset,
-    contract_id: &Hash,
+    asset: impl Into<Asset>,
+    contract_id: &stellar_strkey::Contract,
     sequence: i64,
     fee: u32,
     _network_passphrase: &str,
-    key: &ed25519_dalek::SigningKey,
+    source_account: MuxedAccount,
 ) -> Result<Transaction, Error> {
-    let contract = ScAddress::Contract(contract_id.clone());
+    let contract = ScAddress::Contract(Hash(contract_id.0));
     let mut read_write = vec![
         ContractData(LedgerKeyContractData {
             contract: contract.clone(),
@@ -158,7 +152,8 @@ fn build_wrap_token_tx(
             durability: ContractDataDurability::Persistent,
         }),
     ];
-    if asset != &Asset::Native {
+    let asset = asset.into();
+    if asset != Asset::Native {
         read_write.push(ContractData(LedgerKeyContractData {
             contract,
             key: ScVal::Vec(Some(
@@ -172,7 +167,7 @@ fn build_wrap_token_tx(
         source_account: None,
         body: OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
             host_function: HostFunction::CreateContract(CreateContractArgs {
-                contract_id_preimage: ContractIdPreimage::Asset(asset.clone()),
+                contract_id_preimage: ContractIdPreimage::Asset(asset),
                 executable: ContractExecutable::StellarAsset,
             }),
             auth: VecM::default(),
@@ -180,7 +175,7 @@ fn build_wrap_token_tx(
     };
 
     Ok(Transaction {
-        source_account: MuxedAccount::Ed25519(Uint256(key.verifying_key().to_bytes())),
+        source_account,
         fee,
         seq_num: SequenceNumber(sequence),
         cond: Preconditions::None,
